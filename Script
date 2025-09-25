@@ -1,0 +1,184 @@
+import cv2
+import pandas as pd
+import numpy as np
+import time
+import os
+import csv
+import random
+import matplotlib.pyplot as plt
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+
+# -----------------------------
+# Parameters
+# -----------------------------
+video_path = 'drone_video.mp4'
+output_csv = 'latency_results.csv'
+
+network_base_latency = 0.05   # base 50ms
+network_jitter = 0.02         # ±20ms to example real situation
+packet_loss_rate = 0.05       # 5% chance to drop frame ti remsemble real situation
+#AES dictionary
+encryption_schemes = {
+    'AES-128': 16,  # 16 bytes = 128 bits
+    'AES-256': 32, # 32 bytes = 256 bits
+    'ChaCha20': 32
+}
+
+# -----------------------------
+# Helper Functions
+# -----------------------------
+def pad_frame(frame_bytes):
+    #AES can only do frames of 16, not random amount so have to account for that
+    padding_len = 16 - (len(frame_bytes) % 16)
+    return frame_bytes + bytes([padding_len])*padding_len
+
+def unpad_frame(frame_bytes):
+    padding_len = frame_bytes[-1]
+    return frame_bytes[:-padding_len]
+    #removes padding based on the last byte's value
+
+def encrypt_frame(frame_bytes, key):
+    #Create AES cipher with CBC(Cipher Block Chaining) which combines each plaintext block with the previous cipher block before encryption
+    #A new random IV prevents replay attacks in which the data is intercepted and retransmitted
+    iv = os.urandom(16)
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(frame_bytes) + encryptor.finalize()
+    return ciphertext, iv
+
+def decrypt_frame(ciphertext, key, iv):
+    #just decrypts using same key and IV
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    #backend tells the program which implementtation of the encryption to use
+    decryptor = cipher.decryptor()
+    plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+    return plaintext
+    #Apparently ChaCha20 uses a Nonce and I needed to look up what that was
+def encrypt_chacha(frame_bytes, key):
+    #Since ChaCha20 is a stream cipher, it needs a number used once(nonce) instead of an IV
+    nonce = os.urandom(16)
+    cipher = Cipher(algorithms.ChaCha20(key, nonce), mode = None, backend = default_backend())
+    #mode equals none because a stream cipher doesn't need that CBC stuff
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(frame_bytes)
+    return ciphertext, nonce
+def decrypt_chacha(ciphertext,key, nonce):
+    cipher = Cipher(algorithms.ChaCha20(key, nonce), mode = None, backend = default_backend())
+    decryptor = cipher.decryptor()
+    plaintext = decryptor.update(ciphertext)
+    return plaintext
+
+def simulate_network_latency(base_latency=0.05, jitter=0.02, loss_rate=0.05):
+    # Randomize network latency to simulate real world
+    latency = base_latency + random.uniform(-jitter, jitter)
+    if random.random() < loss_rate:
+        return None  # Frame lost
+    time.sleep(latency)
+    #time pauses the program to simulate the time it would to travel over WiFi in reall world instead of instantly processing
+    return latency * 1000  # ms
+
+# ----------------------------- 
+# Main Simulation :)
+# -----------------------------
+cap = cv2.VideoCapture(video_path)
+#Load video
+if not cap.isOpened():
+    raise Exception(f"Cannot open video {video_path}")
+
+# CSV setup
+with open(output_csv, mode='w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(['Scheme', 'Frame', 'Encrypt(ms)', 'Decrypt(ms)', 'End-to-End(ms)'])
+    #Write latency results
+# One-time key exchange overhead
+handshake_latency_ms = 50
+time.sleep(handshake_latency_ms / 1000.0)
+session_key = os.urandom(32)
+#Simulate key exchange/ key negotiation
+frame_num = 0
+while True:
+    ret, frame = cap.read() #read frame one by one
+    if not ret:
+        break  # End of video
+    frame_num += 1
+
+    # Compress frame (simulate H.264-like encoding with JPEG)
+    frame_bytes = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])[1].tobytes()
+    frame_bytes = pad_frame(frame_bytes)
+    #convert frame to JPEG
+    #reduces size before encryption like real work
+    # pads to that 16 byte that AES loves
+
+    for scheme, key_len in encryption_schemes.items():
+        # Use a session key (in practice, negotiated once at session start)
+        key = os.urandom(key_len)
+        #if for either AES or ChaCha20
+        if scheme.startswith("AES"):
+            ciphertext, iv = encrypt_frame(frame_bytes, key)
+            decrypted_bytes = decrypt_frame(ciphertext, key, iv)
+        elif scheme == "ChaCha20":
+            ciphertext, nonce = encrypt_chacha(frame_bytes, key)
+            decrypted_bytes = decrypt_chacha(ciphertext, key, nonce)
+
+        # Encrypt
+        t_start = time.time()
+        ciphertext, iv = encrypt_frame(frame_bytes, key)
+        t_encrypt = (time.time() - t_start) * 1000  # ms
+        #Measure encryption time
+        # Simulated network
+        net_latency = simulate_network_latency(network_base_latency, network_jitter, packet_loss_rate)
+        if net_latency is None:
+            continue  # frame dropped, skip logging
+
+        # Decrypt
+        t_start = time.time()
+        decrypted_bytes = decrypt_frame(ciphertext, key, iv)
+        t_decrypt = (time.time() - t_start) * 1000
+        #Measure the decrption time
+
+        # End-to-end latency
+        total_latency = t_encrypt + t_decrypt + net_latency
+
+        # Save results
+        with open(output_csv, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([scheme, frame_num,
+                             round(t_encrypt, 2),
+                             round(t_decrypt, 2),
+                             round(total_latency, 2)])
+
+cap.release()
+
+df = pd.read_csv("latency_results.csv")
+print(df.groupby("Scheme")[["Encrypt(ms)", "Decrypt(ms)", "End-to-End(ms)"]].mean())
+
+schemes = df['Scheme'].unique()
+#group by encryption scheme
+
+plt.figure(figsize=(12,6))
+
+for scheme in schemes:
+    df_scheme = df[df['Scheme'] == scheme]
+    if not df_scheme.empty:
+        x = df_scheme['Frame']
+        y = df_scheme['End-to-End(ms)']
+        
+        # Plot raw data
+        plt.scatter(x, y, s=10, alpha=0.5, label=f'{scheme} data')
+        
+        # Compute line of best fit
+        coeffs = np.polyfit(x, y, 1)  # degree 1 = linear
+        y_fit = np.polyval(coeffs, x)
+        
+        # Plot line of best fit
+        plt.plot(x, y_fit, linewidth=2, label=f'{scheme} trend')
+    #filter row for scheme
+    #plot the chart
+plt.title('End-to-End Latency per Frame for Different Encryption Schemes')
+plt.xlabel('Frame Number')
+plt.ylabel('End-to-End Latency (ms)')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
